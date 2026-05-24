@@ -77,16 +77,33 @@ func NewClient(tx BlockTransport, params HandshakeParams) *Client {
 }
 
 // Dial opens a fresh connection, performs TLS + SMP handshake, and returns a
-// Client. Currently the SMP handshake (paddedServerHello / paddedClientHello
-// + thAuth derivation for v7+) is gated on crypto work in slice 2. Until
-// then, callers should DialTLS themselves, construct HandshakeParams, and
-// use NewClient.
-func Dial(ctx context.Context, addr string, expected KeyHash, cfg TransportConfig) (*Client, error) {
-	_ = ctx
-	_ = addr
-	_ = expected
-	_ = cfg
-	return nil, errors.New("smp: Dial unimplemented — see NewClient (SMP handshake pending slice-2 crypto)")
+// Client ready for SMP commands.
+//
+// `sessionID` is the SMP session identifier — in production this is derived
+// from the TLS handshake (Haskell uses RFC 5929 tls-unique; Go's TLS 1.3
+// doesn't expose that, so callers must supply a value out-of-band or use
+// ExportKeyingMaterial themselves). Whatever the caller passes is asserted
+// to match what the server claims in its hello block.
+//
+// `ownAuthPriv` is the client's 32-byte X25519 private key whose public
+// counterpart will be offered to the server for v7+ deniable command
+// authentication. Pass nil for v<V7 or if the caller doesn't intend to
+// authenticate commands (a fresh ephemeral key is generated for v7+ so the
+// handshake completes either way; the caller-supplied key is preferred so
+// the same key can be reused for later X25519AuthSigner construction).
+//
+// SPEC: simplexmq Transport.hs:792 (smpClientHandshake).
+func Dial(ctx context.Context, addr string, expected KeyHash, sessionID SessionID, ownAuthPriv []byte, cfg TransportConfig) (*Client, error) {
+	conn, err := DialTLS(ctx, addr, expected, cfg)
+	if err != nil {
+		return nil, err
+	}
+	params, err := runSMPClientHandshake(ctx, conn, expected, sessionID, ownAuthPriv)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return NewClient(conn, params), nil
 }
 
 // Close terminates the SMP session: closes the underlying transport, drains

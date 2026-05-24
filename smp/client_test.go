@@ -48,7 +48,10 @@ func TestRoundTrip(t *testing.T) {
 	defer cancel()
 
 	cfg := TransportConfig{DialTimeout: 10 * time.Second, IOTimeout: 5 * time.Second}
-	client, err := Dial(ctx, addr, fp, cfg)
+	// SMP_SESSION_ID is a placeholder until we wire TLS-derived session
+	// identifier extraction (see runSMPClientHandshake docs).
+	sessID := []byte(os.Getenv("SMP_SESSION_ID"))
+	client, err := Dial(ctx, addr, fp, sessID, nil, cfg)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
