@@ -23,8 +23,14 @@ The canonical implementation is [`simplexmq`](https://github.com/simplex-chat/si
 
 ## Companion project
 
-[Kozi](https://github.com/lapingvino/kozi) is an Android proximity-overlap app that consumes `simplex-go` (compiled to an AAR via `gomobile bind`) for its messaging layer.
+[Kozi](https://github.com/LaPingvino/kozi) is an Android proximity-overlap app that consumes `simplex-go` (compiled to an AAR via `gomobile bind`) for its messaging layer.
 
 ## License
 
-AGPL-3.0, matching the upstream project.
+MIT.
+
+(Upstream simplexmq is AGPL-3.0. Protocol designs are not copyrightable; this
+is a clean-room implementation written from spec docs without reading the
+Haskell sources for translation, so it is licensable independently. If you
+intend to *port* code directly from simplexmq into this repo, that contribution
+needs to be relicensed to MIT by the author or kept out.)
