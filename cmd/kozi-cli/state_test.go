@@ -89,6 +89,8 @@ func TestSetLocationAndList(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
 
+	// Inputs longer than proximityPrefixLen are truncated to the coarse
+	// neighborhood prefix (privacy default; see normalizePlusCode).
 	if err := cmdSetLocation([]string{"8FVC9G8F"}); err != nil {
 		t.Fatalf("set-location: %v", err)
 	}
@@ -96,17 +98,18 @@ func TestSetLocationAndList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.CurrentLocation != "8FVC9G8F" {
-		t.Errorf("CurrentLocation after set: got %q want 8FVC9G8F", s.CurrentLocation)
+	if s.CurrentLocation != "8FVC9G" {
+		t.Errorf("CurrentLocation after set: got %q want 8FVC9G (truncated to %d-char prefix)",
+			s.CurrentLocation, proximityPrefixLen)
 	}
 
-	// Re-set should overwrite.
+	// Re-set should overwrite, also normalized.
 	if err := cmdSetLocation([]string{"8FXX0000"}); err != nil {
 		t.Fatal(err)
 	}
 	s, _ = loadState()
-	if s.CurrentLocation != "8FXX0000" {
-		t.Errorf("CurrentLocation after re-set: got %q want 8FXX0000", s.CurrentLocation)
+	if s.CurrentLocation != "8FXX00" {
+		t.Errorf("CurrentLocation after re-set: got %q want 8FXX00", s.CurrentLocation)
 	}
 
 	// list with no buddies should not error.
@@ -163,11 +166,6 @@ func TestUnpair(t *testing.T) {
 	}
 }
 
-func TestPairAndProximityWatchAreStubs(t *testing.T) {
-	if err := cmdPair([]string{"smp://example"}); err == nil {
-		t.Error("pair: expected stub error")
-	}
-	if err := cmdProximityWatch(nil); err == nil {
-		t.Error("proximity-watch: expected stub error")
-	}
-}
+// (TestPairAndProximityWatchAreStubs removed — both cmdPair and
+// cmdProximityWatch now have real implementations; pair is exercised in
+// pair_test.go and proximity-watch's logic via watchOnce in proximity_test.go.)

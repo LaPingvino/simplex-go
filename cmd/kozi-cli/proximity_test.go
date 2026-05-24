@@ -117,8 +117,8 @@ func TestWatchOnceMatchFires(t *testing.T) {
 	if notifier.count() != 1 {
 		t.Fatalf("notifier fires: got %d want 1", notifier.count())
 	}
-	if !strings.Contains(notifier.sent[0], "alice") || !strings.Contains(notifier.sent[0], "8FVC9G8F") {
-		t.Errorf("notification body missing buddy/grid: %q", notifier.sent[0])
+	if !strings.Contains(notifier.sent[0], "alice") || !strings.Contains(notifier.sent[0], "8FVC9G") {
+		t.Errorf("notification body missing buddy/normalized-grid: %q", notifier.sent[0])
 	}
 }
 

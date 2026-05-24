@@ -5,10 +5,30 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/LaPingvino/simplex-go/smp"
 )
+
+// proximityPrefixLen is the maximum Plus Code prefix length used by kozi-cli
+// for proximity matching. 6 chars ≈ 5km × 5km neighborhood-scale — chosen
+// to keep the resolution coarse enough that publishing it doesn't dox you.
+//
+// Reference: https://en.wikipedia.org/wiki/Open_Location_Code#Encoding
+// 6 chars covers ~5km² when ignoring the '+' separator.
+const proximityPrefixLen = 6
+
+// normalizePlusCode strips the '+' separator, uppercases, and truncates to
+// proximityPrefixLen. Both set-location and the proximity comparison pass
+// through this so paste-the-full-thing and stored-coarse values still match.
+func normalizePlusCode(s string) string {
+	s = strings.ToUpper(strings.ReplaceAll(s, "+", ""))
+	if len(s) > proximityPrefixLen {
+		s = s[:proximityPrefixLen]
+	}
+	return s
+}
 
 func cmdPair(args []string) error {
 	if len(args) != 2 {
@@ -102,10 +122,14 @@ func cmdSetLocation(args []string) error {
 	if len(args) != 1 {
 		return errors.New("set-location requires exactly one argument: <plus-code>")
 	}
-	code := args[0]
-	if len(code) < 4 || len(code) > 16 {
-		return fmt.Errorf("plus-code %q has implausible length (expected 4-16 chars)", code)
+	raw := args[0]
+	if len(raw) < 4 {
+		return fmt.Errorf("plus-code %q too short (need at least 4 chars)", raw)
 	}
+	if len(raw) > 16 {
+		return fmt.Errorf("plus-code %q implausibly long (max 16 chars before normalization)", raw)
+	}
+	code := normalizePlusCode(raw)
 	s, err := loadState()
 	if err != nil {
 		return err
@@ -114,7 +138,12 @@ func cmdSetLocation(args []string) error {
 	if err := saveState(s); err != nil {
 		return err
 	}
-	fmt.Printf("Current location set to %s\n", code)
+	if code == strings.ToUpper(strings.ReplaceAll(raw, "+", "")) {
+		fmt.Printf("Current location set to %s\n", code)
+	} else {
+		fmt.Printf("Current location set to %s (truncated from %q to %d-char neighborhood prefix for privacy)\n",
+			code, raw, proximityPrefixLen)
+	}
 	return nil
 }
 

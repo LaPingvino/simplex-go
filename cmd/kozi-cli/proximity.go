@@ -78,6 +78,15 @@ func hourBucket(t time.Time) string {
 //
 // Returns the names of buddies that triggered a notification this tick.
 func watchOnce(s *State, cfg WatchConfig) ([]string, error) {
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.Notifier == nil {
+		// Don't default to notify-send here — tests would silently invoke
+		// the real notifier and hang (no D-Bus session). Production callers
+		// pass defaultWatchConfig() which fills it in.
+		return nil, errors.New("watchOnce: cfg.Notifier is nil")
+	}
 	if s.CurrentLocation == "" {
 		return nil, errors.New("current location not set; use `kozi-cli set-location <plus-code>`")
 	}
@@ -86,22 +95,25 @@ func watchOnce(s *State, cfg WatchConfig) ([]string, error) {
 	bucket := hourBucket(now)
 	matches := make([]string, 0, len(s.Buddies))
 
+	myGrid := normalizePlusCode(s.CurrentLocation)
 	for _, b := range s.Buddies {
 		_ = deriveSlotID(b.SharedSecret, bucket) // TODO(phase-2d): publish + poll via slot
 
 		// STUB: in lieu of a real SMP poll for the buddy's beacon, we
 		// match on LastSeenGrid persisted in state (whichever value a
 		// future SMP receiver wrote there). For local self-testing,
-		// set s.Buddies[i].LastSeenGrid manually in state.json.
+		// set s.Buddies[i].LastSeenGrid manually in state.json. Both
+		// sides normalize so a paste-the-full-thing on one side still
+		// matches the coarse stored value.
 		if b.LastSeenGrid == "" {
 			continue
 		}
-		if b.LastSeenGrid != s.CurrentLocation {
+		if normalizePlusCode(b.LastSeenGrid) != myGrid {
 			continue
 		}
 		matches = append(matches, b.Name)
 		title := "Kozi: proximity match"
-		body := fmt.Sprintf("%s might be nearby (grid %s)", b.Name, s.CurrentLocation)
+		body := fmt.Sprintf("%s might be nearby (neighborhood %s)", b.Name, myGrid)
 		if err := cfg.Notifier.Notify(title, body); err != nil {
 			return matches, fmt.Errorf("notify %s: %w", b.Name, err)
 		}
