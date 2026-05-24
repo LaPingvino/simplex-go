@@ -67,6 +67,42 @@ func TestInt64RoundTrip(t *testing.T) {
 	}
 }
 
+// TestInt64KAT_Haskell verifies our Int64 encoding matches the canonical
+// Haskell test vector from simplexmq/tests/CoreTests/EncodingTests.hs:24-36.
+//
+// Haskell test:
+//
+//	int64 = 1234567890123456789
+//	s64   = "\17\34\16\244\125\233\129\21"  -- = 0x11 0x22 0x10 0xF4 0x7D 0xE9 0x81 0x15
+//	smpEncode int64 `shouldBe` s64
+//
+// This is the only static byte-level KAT in the upstream test suite. All
+// other "tests" there use either round-trip properties (encode/decode
+// identity) or random inputs, which don't give portable fixtures.
+//
+// If this test passes, our Int64 byte order (two BE Word32s: high then low)
+// matches simplexmq exactly. Since every multi-byte primitive in our
+// encoding stack is built on the same BE convention, this single KAT
+// transitively validates the foundation.
+func TestInt64KAT_Haskell(t *testing.T) {
+	const v int64 = 1234567890123456789
+	want := []byte{0x11, 0x22, 0x10, 0xF4, 0x7D, 0xE9, 0x81, 0x15}
+
+	e := NewEncoder()
+	e.Int64(v)
+	if !bytes.Equal(e.Bytes(), want) {
+		t.Fatalf("Int64 KAT mismatch:\n  got  %x\n  want %x", e.Bytes(), want)
+	}
+
+	got, err := NewDecoder(want).Int64()
+	if err != nil {
+		t.Fatalf("Int64 KAT decode: %v", err)
+	}
+	if got != v {
+		t.Fatalf("Int64 KAT decode: got %d want %d", got, v)
+	}
+}
+
 func TestInt64HighLowOrder(t *testing.T) {
 	// SPEC: Int64 = w32(high) ++ w32(low). 0x0102030405060708 should
 	// serialize to 01 02 03 04 05 06 07 08 (high 32 first).
