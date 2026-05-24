@@ -2,32 +2,42 @@ package smp
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"fmt"
+	"io"
 	"sync"
 )
 
-// Client is a single TLS-pinned, handshake-completed connection to one SMP
-// server. It is the entry point for all five vertical-slice commands:
-// NewQueue, Subscribe, Send, Receive, Ack.
+// BlockTransport is the lower-level interface Client uses to exchange SMP
+// transport blocks with a server. *Conn implements it directly; tests use a
+// fake implementation.
+type BlockTransport interface {
+	ReadBlock(ctx context.Context) ([]byte, error)
+	WriteBlock(ctx context.Context, payload []byte) error
+	Close() error
+}
+
+// Client is a single connection to one SMP server, with the SMP handshake
+// already complete (params populated).
 //
-// Concurrency model (subject to open-question #1 in the report):
-//   - One goroutine owns the receive side and dispatches incoming MSG / END
-//     events to per-queue subscribers.
-//   - Send-side methods are safe for concurrent callers; the underlying TLS
-//     writer is serialized with a mutex.
+// Concurrency model:
+//   - One goroutine owns the receive side and dispatches incoming MSG/END
+//     events to per-queue subscribers, and correlated responses to in-flight
+//     command requests.
+//   - Send-side methods are safe for concurrent callers; underlying
+//     BlockTransport.WriteBlock is serialized via mu.
 //   - All blocking methods accept a context.Context.
 type Client struct {
-	conn   *Conn
+	tx     BlockTransport
 	params HandshakeParams
 
-	mu  sync.Mutex // serializes block writes
-	// sentCmds maps CorrID -> chan<- BrokerMsg for in-flight commands
-	// awaiting a server response. The reader goroutine fills these.
-	sentCmds map[CorrID]chan BrokerMsg
+	mu       sync.Mutex
+	closed   bool
+	sentCmds map[CorrID]chan brokerResult
+	subs     map[string]chan Message
 
-	// subs maps RecipientID -> channel that the reader pushes MSG events to.
-	// Closed when the queue is unsubscribed or the connection drops.
-	subs map[string]chan Message
+	readerDone chan struct{}
 }
 
 // HandshakeParams is the negotiated SMP session state after both the TLS and
@@ -46,132 +56,294 @@ type HandshakeParams struct {
 	BlockSize int
 }
 
-// Dial opens a fresh connection to the SMP server at addr, runs the TLS
-// handshake (pinning the offline cert fingerprint to `expected`), and then
-// performs the SMP server/client handshake.
-//
-// On success the returned Client has a background reader goroutine running.
-//
-// SPEC ref: Haskell `smpClientHandshake` (Transport.hs:792). Order of
-// operations:
-//  1. TLS handshake with ALPN "smp/1".
-//  2. Read paddedServerHello block.
-//  3. Validate `serverIdentity` fingerprint inside the cert chain returned in
-//     paddedServerHello.authPubKey.
-//  4. Choose the max of (our version range ∩ server's range).
-//  5. Write paddedClientHello with our chosen version.
-//  6. Compute thAuth (sessSecret) when v >= 7.
-//  7. Spawn the reader goroutine.
+type brokerResult struct {
+	msg BrokerMsg
+	err error
+}
+
+// NewClient wraps an already-handshook BlockTransport in a Client and starts
+// the reader goroutine. Use Dial for the full TLS + SMP handshake path
+// (currently unimplemented — see Dial doc).
+func NewClient(tx BlockTransport, params HandshakeParams) *Client {
+	c := &Client{
+		tx:         tx,
+		params:     params,
+		sentCmds:   make(map[CorrID]chan brokerResult),
+		subs:       make(map[string]chan Message),
+		readerDone: make(chan struct{}),
+	}
+	go c.readLoop()
+	return c
+}
+
+// Dial opens a fresh connection, performs TLS + SMP handshake, and returns a
+// Client. Currently the SMP handshake (paddedServerHello / paddedClientHello
+// + thAuth derivation for v7+) is gated on crypto work in slice 2. Until
+// then, callers should DialTLS themselves, construct HandshakeParams, and
+// use NewClient.
 func Dial(ctx context.Context, addr string, expected KeyHash, cfg TransportConfig) (*Client, error) {
 	_ = ctx
 	_ = addr
 	_ = expected
 	_ = cfg
-	panic("not implemented")
+	return nil, errors.New("smp: Dial unimplemented — see NewClient (SMP handshake pending slice-2 crypto)")
 }
 
-// Close terminates the SMP session, closes the underlying TLS connection,
-// drains in-flight command channels with ErrClientClosed, and joins the
-// reader goroutine.
+// Close terminates the SMP session: closes the underlying transport, drains
+// in-flight command channels with ErrClientClosed, closes subscriber channels,
+// and joins the reader goroutine.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
 	}
-	panic("not implemented")
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	for cid, ch := range c.sentCmds {
+		ch <- brokerResult{err: ErrClientClosed}
+		close(ch)
+		delete(c.sentCmds, cid)
+	}
+	for rid, ch := range c.subs {
+		close(ch)
+		delete(c.subs, rid)
+	}
+	c.mu.Unlock()
+
+	err := c.tx.Close()
+	<-c.readerDone
+	return err
 }
 
-// NewQueue sends a NEW command and returns the server-assigned (RecipientID,
-// SenderID) plus the server's DH public key for the per-queue body-encryption
-// secret.
+// readLoop reads blocks from the transport and dispatches transmissions.
+func (c *Client) readLoop() {
+	defer close(c.readerDone)
+	for {
+		block, err := c.tx.ReadBlock(context.Background())
+		if err != nil {
+			c.handleReadError(err)
+			return
+		}
+		txs, err := DecodeBlock(c.params.Version, c.params.SessID, block)
+		if err != nil {
+			// Slice 1: drop malformed blocks silently. Real impl should log.
+			continue
+		}
+		for _, tx := range txs {
+			c.dispatch(tx)
+		}
+	}
+}
+
+func (c *Client) handleReadError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
+	wrapped := fmt.Errorf("smp: read: %w", err)
+	for cid, ch := range c.sentCmds {
+		ch <- brokerResult{err: wrapped}
+		close(ch)
+		delete(c.sentCmds, cid)
+	}
+	for rid, ch := range c.subs {
+		close(ch)
+		delete(c.subs, rid)
+	}
+}
+
+func (c *Client) dispatch(tx Transmission) {
+	msg, err := DecodeBrokerMsg(c.params.Version, tx.Command)
+	if err != nil {
+		return // drop unparseable; slice 1 simplicity
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if tx.CorrID == (CorrID{}) {
+		// Server-pushed event: MSG (to subscriber) or END (close subscriber).
+		key := string(tx.EntityID)
+		ch, ok := c.subs[key]
+		if !ok {
+			return
+		}
+		switch m := msg.(type) {
+		case MsgMsg:
+			select {
+			case ch <- m.Msg:
+			default:
+				// Subscriber buffer full — drop. Slice 1 simplicity;
+				// real impl needs backpressure or a larger buffer.
+			}
+		case EndMsg:
+			close(ch)
+			delete(c.subs, key)
+		}
+		return
+	}
+	// Correlated response to one of our commands.
+	if ch, ok := c.sentCmds[tx.CorrID]; ok {
+		ch <- brokerResult{msg: msg}
+		close(ch)
+		delete(c.sentCmds, tx.CorrID)
+	}
+}
+
+// send is the common request-response path: build transmission, write block,
+// await response correlated by corrId.
+func (c *Client) send(ctx context.Context, signKey RcvAuthKey, entityID EntityID, cmd Command) (BrokerMsg, error) {
+	cmdBytes, err := EncodeCommand(c.params.Version, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	cid, err := newCorrID()
+	if err != nil {
+		return nil, fmt.Errorf("smp: corrId: %w", err)
+	}
+
+	tx := Transmission{
+		CorrID:   cid,
+		EntityID: entityID,
+		Command:  cmdBytes,
+	}
+
+	// Compute auth bytes from a zero-Authorization transmission.
+	_, authBytes, err := EncodeTransmission(c.params.Version, c.params.SessID, tx)
+	if err != nil {
+		return nil, err
+	}
+	if signKey != nil {
+		sig, err := signKey.Authorize(authBytes, cid)
+		if err != nil {
+			return nil, fmt.Errorf("smp: authorize: %w", err)
+		}
+		tx.Authorization = sig
+	}
+
+	wireBytes, _, err := EncodeTransmission(c.params.Version, c.params.SessID, tx)
+	if err != nil {
+		return nil, err
+	}
+	block, err := EncodeBlock(wireBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	respCh := make(chan brokerResult, 1)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, ErrClientClosed
+	}
+	c.sentCmds[cid] = respCh
+	c.mu.Unlock()
+
+	if err := c.tx.WriteBlock(ctx, block); err != nil {
+		c.mu.Lock()
+		delete(c.sentCmds, cid)
+		c.mu.Unlock()
+		return nil, fmt.Errorf("smp: write: %w", err)
+	}
+
+	select {
+	case r := <-respCh:
+		if r.err != nil {
+			return nil, r.err
+		}
+		if e, ok := r.msg.(ErrMsg); ok {
+			return nil, e
+		}
+		return r.msg, nil
+	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.sentCmds, cid)
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+func newCorrID() (CorrID, error) {
+	var c CorrID
+	_, err := io.ReadFull(rand.Reader, c[:])
+	return c, err
+}
+
+// Ping sends PING and waits for PONG. SPEC: section "Keep-alive command".
+func (c *Client) Ping(ctx context.Context) error {
+	msg, err := c.send(ctx, nil, NoEntity, PingCmd{})
+	if err != nil {
+		return err
+	}
+	if _, ok := msg.(PongMsg); !ok {
+		return fmt.Errorf("smp: PING expected PONG, got %T", msg)
+	}
+	return nil
+}
+
+// Send issues a SEND command to (sndID). `sigKey` may be nil for unauthorized
+// sends before the queue is KEY/SKEY-secured. `body` is the pre-encoded
+// smpEncMessage payload (not a raw application message).
 //
-// `req.RcvAuthPubKeyDER` must be the X.509 SPKI form of the public key whose
-// private counterpart will sign all subsequent recipient commands on this
-// queue. `req.RcvDHPubKeyDER` is the X25519 DH public key.
+// SPEC: section "Send message". Haskell ref: sendSMPMessage (Client.hs:1027).
+func (c *Client) Send(ctx context.Context, sigKey SndAuthKey, sndID QueueID, flags MsgFlags, body []byte) error {
+	msg, err := c.send(ctx, sigKey, sndID, SendCmd{Flags: flags, Body: body})
+	if err != nil {
+		return err
+	}
+	if _, ok := msg.(OKMsg); !ok {
+		return fmt.Errorf("smp: SEND expected OK, got %T", msg)
+	}
+	return nil
+}
+
+// Ack acknowledges receipt of msgID on queue rcvID. Until Ack succeeds the
+// server will not deliver the next message on this queue.
 //
-// Caller is responsible for generating both keypairs and stashing the
-// private halves; this package does not own key material.
-//
-// SPEC: section "Create queue command".
-// Haskell ref: createSMPQueue (Client.hs:813).
+// SPEC: section "Acknowledge message delivery". Haskell ref: ackSMPMessage
+// (Client.hs:1040).
+func (c *Client) Ack(ctx context.Context, signKey RcvAuthKey, rcvID QueueID, msgID MsgID) error {
+	msg, err := c.send(ctx, signKey, rcvID, AckCmd{MsgID: msgID})
+	if err != nil {
+		return err
+	}
+	if _, ok := msg.(OKMsg); !ok {
+		return fmt.Errorf("smp: ACK expected OK, got %T", msg)
+	}
+	return nil
+}
+
+// NewQueue and Subscribe are gated on sub-channel-registration logic that
+// must handle the SubscribeMode=S race (server may push MSGs before we have
+// registered a subscriber for the rcvID returned in IDS). Implemented in a
+// follow-up iteration.
+
 func (c *Client) NewQueue(ctx context.Context, signKey RcvAuthKey, req NewQueueReq) (IDSResponse, error) {
 	_ = ctx
 	_ = signKey
 	_ = req
-	panic("not implemented")
+	return IDSResponse{}, errors.New("smp: NewQueue not yet implemented")
 }
 
-// Subscribe issues a SUB command on (rcvID) and returns a channel that the
-// reader goroutine will push delivered Messages into. The channel is closed
-// when an END is received (another connection has taken over) or the Client
-// is closed.
-//
-// The caller must Ack each message before the next will be delivered (SPEC:
-// "to receive the following message the recipient must acknowledge the
-// reception of the message").
-//
-// SPEC: section "Subscribe to queue".
-// Haskell ref: subscribeSMPQueue (Client.hs:833).
 func (c *Client) Subscribe(ctx context.Context, signKey RcvAuthKey, rcvID QueueID) (<-chan Message, error) {
 	_ = ctx
 	_ = signKey
 	_ = rcvID
-	panic("not implemented")
-}
-
-// Send issues a SEND command to (sndID). For the first vertical-slice test we
-// send an unauthorized empty-header body (the spec allows unauthorized SEND
-// before a queue is secured). `body` is the pre-encoded smpEncMessage
-// payload, NOT a raw application message.
-//
-// `sigKey` may be nil for unauthorized sends (queue not yet KEY'd). Otherwise
-// it is the sender's private key whose public counterpart was registered with
-// KEY / SKEY.
-//
-// SPEC: section "Send message".
-// Haskell ref: sendSMPMessage (Client.hs:1027).
-func (c *Client) Send(ctx context.Context, sigKey SndAuthKey, sndID QueueID, flags MsgFlags, body []byte) error {
-	_ = ctx
-	_ = sigKey
-	_ = sndID
-	_ = flags
-	_ = body
-	panic("not implemented")
-}
-
-// Ack acknowledges receipt of msgID on queue rcvID. Until Ack succeeds, the
-// server will not deliver the next message on this queue.
-//
-// SPEC: section "Acknowledge message delivery".
-// Haskell ref: ackSMPMessage (Client.hs:1040).
-func (c *Client) Ack(ctx context.Context, signKey RcvAuthKey, rcvID QueueID, msgID MsgID) error {
-	_ = ctx
-	_ = signKey
-	_ = rcvID
-	_ = msgID
-	panic("not implemented")
-}
-
-// Ping sends PING and waits for PONG. Useful for liveness checks and traffic
-// padding (SPEC: "to keep the transport connection alive and to generate
-// noise traffic the clients should use ping command").
-func (c *Client) Ping(ctx context.Context) error {
-	_ = ctx
-	panic("not implemented")
+	return nil, errors.New("smp: Subscribe not yet implemented")
 }
 
 // RcvAuthKey is the private half of a recipient's per-queue authentication
-// key. The concrete representation depends on the auth scheme chosen at
-// queue creation time:
-//   - Ed25519: 32-byte ed25519.PrivateKey seed (crypto/ed25519).
-//   - X25519 (NaCl crypto_box): 32-byte Curve25519 private key.
+// key. Implementations encapsulate the signing/auth-tag operation so this
+// package stays free of crypto dependencies.
 //
-// The opaque interface keeps the smp package from depending on a specific
-// crypto library. Callers wrap their key in a small adapter.
+// For Ed25519: Authorize signs `authorized` with Ed25519 (nonce ignored).
+// For NaCl crypto_box (SMP v7+): Authorize computes the deniable
+// authenticator: crypto_box(sha512(authorized); key=dh(queueKey, serverSessionKey); nonce).
 type RcvAuthKey interface {
-	// Authorize is called per-transmission to either sign (Ed25519) or
-	// compute a crypto_box authenticator (X25519) over `authorized`.
-	// `nonce` is the 24-byte CorrID — used as the NaCl nonce in the X25519
-	// case, ignored for Ed25519.
 	Authorize(authorized []byte, nonce CorrID) ([]byte, error)
 }
 
@@ -182,7 +354,3 @@ type SndAuthKey = RcvAuthKey
 // ErrClientClosed is returned from blocking methods when Client.Close was
 // called or the underlying transport dropped.
 var ErrClientClosed = errors.New("smp: client closed")
-
-// ErrTimeout is a sentinel used when waiting for a server response exceeds
-// the context deadline.
-var ErrTimeout = errors.New("smp: server response timed out")
