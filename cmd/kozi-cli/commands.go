@@ -119,10 +119,7 @@ func cmdSetLocation(args []string) error {
 }
 
 func cmdProximityWatch(args []string) error {
-	if len(args) != 0 {
-		return errors.New("proximity-watch takes no arguments")
-	}
-	return errors.New("proximity-watch not yet implemented — pending Phase 4b (libnotify + SMP queue polling)")
+	return cmdProximityWatchReal(args)
 }
 
 func cmdUnpair(args []string) error {
