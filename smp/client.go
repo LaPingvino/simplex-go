@@ -317,23 +317,95 @@ func (c *Client) Ack(ctx context.Context, signKey RcvAuthKey, rcvID QueueID, msg
 	return nil
 }
 
-// NewQueue and Subscribe are gated on sub-channel-registration logic that
-// must handle the SubscribeMode=S race (server may push MSGs before we have
-// registered a subscriber for the rcvID returned in IDS). Implemented in a
-// follow-up iteration.
-
+// NewQueue sends NEW and returns the server-assigned IDs + DH key.
+//
+// SubscribeMode handling:
+//   - 0 (zero) → defaulted to SubscribeManual ('C').
+//   - SubscribeManual → passed through.
+//   - SubscribeOnCreate → rejected; auto-subscribe needs sub-buffering for
+//     MSGs that may arrive before NewQueue returns and the caller registers a
+//     subscriber. Call NewQueue with SubscribeManual, then Subscribe(rcvID).
+//   - anything else → rejected.
+//
+// SPEC: section "Create queue command". Haskell ref: createSMPQueue (Client.hs:813).
 func (c *Client) NewQueue(ctx context.Context, signKey RcvAuthKey, req NewQueueReq) (IDSResponse, error) {
-	_ = ctx
-	_ = signKey
-	_ = req
-	return IDSResponse{}, errors.New("smp: NewQueue not yet implemented")
+	switch req.SubscribeMode {
+	case 0:
+		req.SubscribeMode = SubscribeManual
+	case SubscribeManual:
+		// ok
+	case SubscribeOnCreate:
+		return IDSResponse{}, errors.New("smp: NewQueue with SubscribeMode=SubscribeOnCreate not yet supported (sub-buffering race); use SubscribeManual and call Subscribe(rcvID) afterward")
+	default:
+		return IDSResponse{}, fmt.Errorf("smp: invalid SubscribeMode %#x", byte(req.SubscribeMode))
+	}
+
+	msg, err := c.send(ctx, signKey, NoEntity, NewCmd{Req: req})
+	if err != nil {
+		return IDSResponse{}, err
+	}
+	ids, ok := msg.(IDSMsg)
+	if !ok {
+		return IDSResponse{}, fmt.Errorf("smp: NEW expected IDS, got %T", msg)
+	}
+	return ids.IDS, nil
 }
 
+// Subscribe sends SUB on rcvID and returns a channel that the reader
+// goroutine pushes delivered Messages into. The channel is closed when the
+// server sends END (another connection took over) or the Client is closed.
+//
+// Behavior:
+//   - Pre-registers subs[rcvID] before SUB is sent — eliminates the race
+//     where a server-pushed MSG (corrId=0) for rcvID could arrive before the
+//     channel exists.
+//   - If SUB's response is MSG instead of OK (server delivers the first
+//     queued message inline), pushes that MSG into the returned channel.
+//   - On error or unexpected response, unregisters the sub and closes the
+//     channel.
+//
+// SPEC: section "Subscribe to queue". Haskell ref: subscribeSMPQueue
+// (Client.hs:833).
 func (c *Client) Subscribe(ctx context.Context, signKey RcvAuthKey, rcvID QueueID) (<-chan Message, error) {
-	_ = ctx
-	_ = signKey
-	_ = rcvID
-	return nil, errors.New("smp: Subscribe not yet implemented")
+	key := string(rcvID)
+
+	ch := make(chan Message, 32)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, ErrClientClosed
+	}
+	if _, exists := c.subs[key]; exists {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("smp: already subscribed to queue %x", rcvID)
+	}
+	c.subs[key] = ch
+	c.mu.Unlock()
+
+	msg, err := c.send(ctx, signKey, rcvID, SubCmd{})
+	if err != nil {
+		c.mu.Lock()
+		delete(c.subs, key)
+		c.mu.Unlock()
+		close(ch)
+		return nil, err
+	}
+
+	switch m := msg.(type) {
+	case OKMsg:
+		// Subscription confirmed; subsequent MSGs come via the subs channel.
+	case MsgMsg:
+		// Server delivered first queued message inline as the SUB response.
+		// Push it through the subscriber channel for the caller.
+		ch <- m.Msg
+	default:
+		c.mu.Lock()
+		delete(c.subs, key)
+		c.mu.Unlock()
+		close(ch)
+		return nil, fmt.Errorf("smp: SUB expected OK or MSG, got %T", msg)
+	}
+	return ch, nil
 }
 
 // RcvAuthKey is the private half of a recipient's per-queue authentication
