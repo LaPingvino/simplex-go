@@ -1,7 +1,9 @@
 package smp
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -192,11 +194,50 @@ type Transmission struct {
 // `corrId entityId` in the authorized transmission body.
 //
 // SPEC ref: Haskell `encodeProtocol v cmd` (Protocol.hs:1681 onward).
-// For the first slice, only NEW / SUB / SEND / ACK are supported.
 func EncodeCommand(v Version, cmd Command) ([]byte, error) {
-	_ = v
-	_ = cmd
-	panic("not implemented")
+	e := NewEncoder()
+	switch c := cmd.(type) {
+	case NewCmd:
+		e.Raw([]byte("NEW "))
+		if err := e.ShortString(c.Req.RcvAuthPubKeyDER); err != nil {
+			return nil, fmt.Errorf("smp: NEW rcvAuthPubKey: %w", err)
+		}
+		if err := e.ShortString(c.Req.RcvDHPubKeyDER); err != nil {
+			return nil, fmt.Errorf("smp: NEW rcvDhPubKey: %w", err)
+		}
+		if err := e.MaybeShortString(c.Req.BasicAuth != "", []byte(c.Req.BasicAuth)); err != nil {
+			return nil, fmt.Errorf("smp: NEW basicAuth: %w", err)
+		}
+		subMode := byte(c.Req.SubscribeMode)
+		if subMode == 0 {
+			subMode = byte(SubscribeOnCreate)
+		}
+		e.Char(subMode)
+		if v >= VersionV9 {
+			e.Bool(c.Req.SenderCanSecure)
+		}
+		return e.Bytes(), nil
+	case SubCmd:
+		return []byte("SUB"), nil
+	case SendCmd:
+		e.Raw([]byte("SEND "))
+		// msgFlags: per Haskell Protocol.hs:889 only the notification byte
+		// is encoded; the spec's "reserved" slot is documentation aspiration.
+		e.Bool(c.Flags.Notification)
+		e.Char(' ')
+		e.Tail(c.Body)
+		return e.Bytes(), nil
+	case AckCmd:
+		e.Raw([]byte("ACK "))
+		if err := e.ShortString(c.MsgID); err != nil {
+			return nil, fmt.Errorf("smp: ACK msgId: %w", err)
+		}
+		return e.Bytes(), nil
+	case PingCmd:
+		return []byte("PING"), nil
+	default:
+		return nil, fmt.Errorf("smp: unknown command type %T", cmd)
+	}
 }
 
 // DecodeBrokerMsg parses a server BrokerMsg (IDS / MSG / OK / ERR / etc.) from
@@ -204,9 +245,85 @@ func EncodeCommand(v Version, cmd Command) ([]byte, error) {
 //
 // SPEC ref: Haskell `protocolP v tag :: Parser BrokerMsg` (Protocol.hs:1865).
 func DecodeBrokerMsg(v Version, raw []byte) (BrokerMsg, error) {
-	_ = v
-	_ = raw
-	panic("not implemented")
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%w: empty broker message", ErrBadEncoding)
+	}
+	switch {
+	case bytes.HasPrefix(raw, []byte("IDS ")):
+		return decodeIDS(v, raw[4:])
+	case bytes.HasPrefix(raw, []byte("MSG ")):
+		return decodeMSG(raw[4:])
+	case bytes.Equal(raw, []byte("OK")):
+		return OKMsg{}, nil
+	case bytes.Equal(raw, []byte("PONG")):
+		return PongMsg{}, nil
+	case bytes.Equal(raw, []byte("END")):
+		return EndMsg{}, nil
+	case bytes.HasPrefix(raw, []byte("ERR ")):
+		return decodeERR(raw[4:])
+	default:
+		// Show up to 16 bytes of the unexpected prefix for diagnostics.
+		end := len(raw)
+		if end > 16 {
+			end = 16
+		}
+		return nil, fmt.Errorf("%w: unknown broker message prefix %q", ErrBadEncoding, raw[:end])
+	}
+}
+
+func decodeIDS(v Version, body []byte) (IDSMsg, error) {
+	d := NewDecoder(body)
+	rcv, err := d.ShortString()
+	if err != nil {
+		return IDSMsg{}, fmt.Errorf("smp: IDS recipientId: %w", err)
+	}
+	snd, err := d.ShortString()
+	if err != nil {
+		return IDSMsg{}, fmt.Errorf("smp: IDS senderId: %w", err)
+	}
+	dh, err := d.ShortString()
+	if err != nil {
+		return IDSMsg{}, fmt.Errorf("smp: IDS srvDhPubKey: %w", err)
+	}
+	resp := IDSResponse{
+		RecipientID: append([]byte(nil), rcv...),
+		SenderID:    append([]byte(nil), snd...),
+		SrvDHPubKey: append([]byte(nil), dh...),
+	}
+	if v >= VersionV9 {
+		secure, err := d.Bool()
+		if err != nil {
+			return IDSMsg{}, fmt.Errorf("smp: IDS sndCanSecure: %w", err)
+		}
+		resp.SndCanSecure = secure
+	}
+	return IDSMsg{IDS: resp}, nil
+}
+
+func decodeMSG(body []byte) (MsgMsg, error) {
+	d := NewDecoder(body)
+	msgID, err := d.ShortString()
+	if err != nil {
+		return MsgMsg{}, fmt.Errorf("smp: MSG msgId: %w", err)
+	}
+	rest := d.Tail()
+	// Ts / Flags / Quota live inside the server-encrypted rcvMsgBody — out of
+	// scope here; slice 2 will decrypt and parse them.
+	return MsgMsg{Msg: Message{
+		ID:   append([]byte(nil), msgID...),
+		Body: append([]byte(nil), rest...),
+	}}, nil
+}
+
+func decodeERR(body []byte) (ErrMsg, error) {
+	sp := bytes.IndexByte(body, ' ')
+	if sp == -1 {
+		return ErrMsg{Type: string(body)}, nil
+	}
+	return ErrMsg{
+		Type:   string(body[:sp]),
+		Detail: string(body[sp+1:]),
+	}, nil
 }
 
 // Command is the closed sum of client-issued SMP commands the first vertical
