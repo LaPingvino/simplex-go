@@ -401,41 +401,180 @@ func (e ErrMsg) Error() string {
 	return "smp: " + e.Type + ": " + e.Detail
 }
 
-// EncodeTransmission writes a single transmission into the authorized form
-// expected on the wire. SPEC:
+// EncodeTransmission serializes a single transmission, returning both:
+//   - wireBytes: what goes on the wire (authorization + [sessId if v<V7] +
+//     corrId + entityId + smpCommand). t.Authorization must already contain
+//     the signature/authenticator bytes (or be empty for unauthorized SEND).
+//   - authBytes: what the authenticator signs (sessId + corrId + entityId +
+//     smpCommand). Always includes sessId, regardless of version.
 //
-//	transmission   = authorization authorized
-//	authorized     = sessionIdentifier corrId entityId smpCommand
+// Two-call pattern for authed commands: call with t.Authorization=nil to get
+// authBytes, sign them, set t.Authorization, call again for wireBytes.
 //
-// In SMP v7+ `sessionIdentifier` is implied (sessId == "") in the transmitted
-// bytes, but is still prepended to the bytes the authenticator covers.
-// `authForBytes` is what the signer/authenticator signs; `wireBytes` is what
-// is actually concatenated into the block payload.
-//
-// Haskell ref: encodeTransmissionForAuth (Protocol.hs:2186).
+// SPEC: encodeTransmissionForAuth (Haskell Protocol.hs:2186).
 func EncodeTransmission(v Version, sessID SessionID, t Transmission) (wireBytes, authBytes []byte, err error) {
-	_ = v
-	_ = sessID
-	_ = t
-	panic("not implemented")
+	// authBytes: sessId + corrId + entityId + smpCommand
+	a := NewEncoder()
+	if err := a.ShortString(sessID); err != nil {
+		return nil, nil, fmt.Errorf("smp: auth sessId: %w", err)
+	}
+	encodeCorrID(a, t.CorrID)
+	if err := a.ShortString(t.EntityID); err != nil {
+		return nil, nil, fmt.Errorf("smp: auth entityId: %w", err)
+	}
+	a.Raw(t.Command)
+	authBytes = a.Bytes()
+
+	// wireBytes: authorization + [sessId if v<V7] + corrId + entityId + smpCommand
+	w := NewEncoder()
+	if err := w.ShortString(t.Authorization); err != nil {
+		return nil, nil, fmt.Errorf("smp: wire authorization: %w", err)
+	}
+	if v < VersionV7 {
+		if err := w.ShortString(sessID); err != nil {
+			return nil, nil, fmt.Errorf("smp: wire sessId: %w", err)
+		}
+	}
+	encodeCorrID(w, t.CorrID)
+	if err := w.ShortString(t.EntityID); err != nil {
+		return nil, nil, fmt.Errorf("smp: wire entityId: %w", err)
+	}
+	w.Raw(t.Command)
+	wireBytes = w.Bytes()
+
+	return wireBytes, authBytes, nil
+}
+
+// encodeCorrID emits 0x18 + 24 bytes for a non-zero CorrID, or 0x00 + nothing
+// for the zero CorrID (server-pushed message convention).
+// SPEC: corrId = %x18 24*24 OCTET / %x0 "".
+func encodeCorrID(e *Encoder, c CorrID) {
+	if c == (CorrID{}) {
+		e.Char(0x00)
+		return
+	}
+	e.Char(0x18)
+	e.Raw(c[:])
+}
+
+// decodeCorrID is the inverse.
+func decodeCorrID(d *Decoder) (CorrID, error) {
+	tag, err := d.Char()
+	if err != nil {
+		return CorrID{}, fmt.Errorf("corrId tag: %w", err)
+	}
+	var cid CorrID
+	switch tag {
+	case 0x00:
+		return cid, nil
+	case 0x18:
+		b, err := d.need(24)
+		if err != nil {
+			return CorrID{}, fmt.Errorf("corrId bytes: %w", err)
+		}
+		copy(cid[:], b)
+		return cid, nil
+	default:
+		return CorrID{}, fmt.Errorf("%w: invalid corrId tag %#x", ErrBadEncoding, tag)
+	}
+}
+
+// EncodeBlock wraps one or more pre-encoded transmissions into a transport-
+// block body (the bytes you'd hand to Conn.WriteBlock).
+//
+// SPEC: transportBlock    = transmissionCount transmissions
+//
+//	transmissionCount  = 1 OCTET
+//	transmissions      = (transmissionLength transmission)*
+//	transmissionLength = 2 OCTET (word16 BE)
+//
+// Batching is on from SMP v4 onward and is always on for the versions we
+// target. Returns ErrBadEncoding if more than 255 transmissions are passed.
+func EncodeBlock(transmissions ...[]byte) ([]byte, error) {
+	if len(transmissions) > 255 {
+		return nil, fmt.Errorf("%w: %d transmissions, max 255", ErrBadEncoding, len(transmissions))
+	}
+	e := NewEncoder()
+	e.Char(byte(len(transmissions)))
+	for i, t := range transmissions {
+		if len(t) > 65535 {
+			return nil, fmt.Errorf("smp: tx %d too large (%d bytes, max 65535)", i, len(t))
+		}
+		e.Word16(uint16(len(t)))
+		e.Raw(t)
+	}
+	return e.Bytes(), nil
 }
 
 // DecodeBlock parses the multi-transmission body of one transport block into
-// individual server transmissions.
+// individual transmissions.
 //
 // SPEC:
 //
 //	transportBlock     = transmissionCount transmissions
 //	transmissionCount  = 1 OCTET
-//	transmissionLength = 2 OCTET (word16 NBO) — only present when batching is on.
+//	transmissionLength = 2 OCTET (word16 NBO)
 //
-// Batching is on starting from SMP v4 and is always on for the versions we
-// target. Haskell ref: tParse (Protocol.hs:2211).
+// For v6, decodes the transmitted sessionId and asserts it matches sessID.
+// For v7+, the sessionId is implied (not on wire), so sessID is unused.
+//
+// Haskell ref: tParse (Protocol.hs:2211).
 func DecodeBlock(v Version, sessID SessionID, block []byte) ([]Transmission, error) {
-	_ = v
-	_ = sessID
-	_ = block
-	panic("not implemented")
+	d := NewDecoder(block)
+	cnt, err := d.Char()
+	if err != nil {
+		return nil, fmt.Errorf("smp: block count: %w", err)
+	}
+	out := make([]Transmission, 0, cnt)
+	for i := 0; i < int(cnt); i++ {
+		tLen, err := d.Word16()
+		if err != nil {
+			return nil, fmt.Errorf("smp: tx %d length: %w", i, err)
+		}
+		body, err := d.need(int(tLen))
+		if err != nil {
+			return nil, fmt.Errorf("smp: tx %d body: %w", i, err)
+		}
+		tx, err := decodeTransmission(v, sessID, body)
+		if err != nil {
+			return nil, fmt.Errorf("smp: tx %d: %w", i, err)
+		}
+		out = append(out, tx)
+	}
+	return out, nil
+}
+
+// decodeTransmission parses one transmission's bytes into Transmission.
+func decodeTransmission(v Version, sessID SessionID, body []byte) (Transmission, error) {
+	d := NewDecoder(body)
+	auth, err := d.ShortString()
+	if err != nil {
+		return Transmission{}, fmt.Errorf("authorization: %w", err)
+	}
+	if v < VersionV7 {
+		gotSess, err := d.ShortString()
+		if err != nil {
+			return Transmission{}, fmt.Errorf("sessId: %w", err)
+		}
+		if !bytes.Equal(gotSess, sessID) {
+			return Transmission{}, fmt.Errorf("%w: sessId mismatch", ErrBadEncoding)
+		}
+	}
+	cid, err := decodeCorrID(d)
+	if err != nil {
+		return Transmission{}, err
+	}
+	entityID, err := d.ShortString()
+	if err != nil {
+		return Transmission{}, fmt.Errorf("entityId: %w", err)
+	}
+	cmd := d.Tail()
+	return Transmission{
+		CorrID:        cid,
+		EntityID:      append(EntityID(nil), entityID...),
+		Command:       append([]byte(nil), cmd...),
+		Authorization: append([]byte(nil), auth...),
+	}, nil
 }
 
 // ErrBadBlock corresponds to SPEC "BLOCK" / Haskell TEBadBlock.
